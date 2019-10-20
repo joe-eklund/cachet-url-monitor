@@ -175,7 +175,7 @@ class Configuration(object):
             else:
                 self.request = requests.request(self.endpoint_method, self.endpoint_url, timeout=self.endpoint_timeout)
             offset = time.altzone if time.daylight else time.timezone
-            self.current_timestamp = int(time.time() - offset if self.local_time else int(time.time))
+            self.current_timestamp = int(time.time() - offset if self.local_time else time.time())
         except requests.ConnectionError:
             self.message = 'The URL is unreachable: %s %s' % (self.endpoint_method, self.endpoint_url)
             self.logger.warning(self.message)
