@@ -37,6 +37,7 @@ class Agent(object):
         """Sets up the schedule based on the configuration file."""
         schedule.every(self.configuration.endpoint['frequency']).seconds.do(self.execute)
 
+
 class Decorator(object):
     def execute(self, configuration):
         pass

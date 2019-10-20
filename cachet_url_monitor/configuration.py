@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 import abc
 import copy
+from distutils.util import strtobool
 import logging
 import os
 import re
@@ -79,7 +80,9 @@ class Configuration(object):
         self.data = config_file
         self.endpoint = self.data['endpoints'][endpoint_index]
         self.current_fails = 0
+        self.current_ups = 0
         self.trigger_update = True
+        
 
         # Exposing the configuration to confirm it's parsed as expected.
         self.print_out()
@@ -96,7 +99,9 @@ class Configuration(object):
         self.endpoint_timeout = self.endpoint.get('timeout') or 1
         self.endpoint_header = self.endpoint.get('header') or None
         self.allowed_fails = self.endpoint.get('allowed_fails') or 0
-
+        self.required_ups = self.endpoint.get('required_ups') or 1
+        self.observe_maintenance = self.endpoint.get('observe_maintenance') or []
+        self.local_time = self.endpoint.get('local_time') or False
         self.api_url = os.environ.get('CACHET_API_URL') or self.data['cachet']['api_url']
         self.component_id = self.endpoint['component_id']
         self.metric_id = self.endpoint.get('metric_id')
@@ -169,19 +174,20 @@ class Configuration(object):
                                                 headers=self.endpoint_header)
             else:
                 self.request = requests.request(self.endpoint_method, self.endpoint_url, timeout=self.endpoint_timeout)
-            self.current_timestamp = int(time.time())
+            offset = time.altzone if time.daylight else time.timezone
+            self.current_timestamp = int(time.time() - offset if self.local_time else int(time.time))
         except requests.ConnectionError:
             self.message = 'The URL is unreachable: %s %s' % (self.endpoint_method, self.endpoint_url)
             self.logger.warning(self.message)
             self.status = st.COMPONENT_STATUS_PARTIAL_OUTAGE
             return
         except requests.HTTPError:
-            self.message = 'Unexpected HTTP response'
+            self.message = f'Unexpected HTTP response from: {self.endpoint_url}'
             self.logger.exception(self.message)
             self.status = st.COMPONENT_STATUS_PARTIAL_OUTAGE
             return
         except requests.Timeout:
-            self.message = 'Request timed out'
+            self.message = f'Request timed out to: {self.endpoint_url}'
             self.logger.warning(self.message)
             self.status = st.COMPONENT_STATUS_PERFORMANCE_ISSUES
             return
@@ -215,29 +221,70 @@ class Configuration(object):
         and only for non-operational ones above the configured threshold (allowed_fails).
         """
 
-        if self.status != 1:
+        if self.status != st.COMPONENT_STATUS_OPERATIONAL:
+            self.current_ups = 0
             self.current_fails = self.current_fails + 1
-            self.logger.info('Failure #%s with threshold set to %s' % (self.current_fails, self.allowed_fails))
+            self.logger.info(f'Failure #{self.current_fails} with threshold set to '
+                             f'{self.allowed_fails} to endpoint {self.endpoint_url}')
             if self.current_fails <= self.allowed_fails:
                 self.trigger_update = False
                 return
+        else:
+            self.current_fails = 0
+            self.current_ups = self.current_ups + 1
+            self.logger.info(f'Success #{self.current_ups} with threshold set to '
+                             f'{self.required_ups} to endpoint {self.endpoint_url}')
+            if self.current_ups < self.required_ups:
+                self.trigger_update = False
+                return
+        self.current_ups = 0
         self.current_fails = 0
         self.trigger_update = True
 
-    def push_status(self):
-        """Pushes the status of the component to the cachet server. It will update the component
-        status based on the previous call to evaluate().
+    def check_maintenance(self):
         """
-        if self.previous_status == self.status:
-            return
-        self.previous_status = self.status
+        Check if maintenance is currently happening.
 
+        :returns: True if cachet is reporting maintence is currently happening. False otherwise.
+        """
+        def _check_in_main(request):
+            for maintenance_ticket in request.json().get('data'):
+                if maintenance_ticket.get('human_status').lower() == 'in progress':
+                    self.logger.info('In maintenance mode.')
+                    return True
+        maintenance_request = requests.get(f'{self.api_url}/schedules')
+        if _check_in_main(request=maintenance_request):
+            return True
+        next_page = maintenance_request.json()['meta']['pagination']['links']['next_page']
+        while(next_page):
+            maintenance_request = requests.get(next_page)
+            if _check_in_main(request=maintenance_request):
+                return True
+            next_page = maintenance_request.json()['meta']['pagination']['links']['next_page']
+        return False
+
+    def push_status(self):
+        """
+        Pushes the status of the component to the cachet server.
+        """
         if not self.trigger_update:
+            self.logger.debug('Trigger update not set. Not pushing status.')
+            return
+
+        # If the component status is the same as our status to set, don't push.
+        if get_current_status(self.api_url, self.component_id, self.headers) == self.status:
+            self.logger.debug('Not pushing status since it\'s the same.')
+            return
+
+        if self.check_maintenance() and 'UPDATE_STATUS' in self.observe_maintenance:
+            self.logger.debug('Not pushing status do to config and maintenance mode.')
+            # We are in maintenance and should not update the status
             return
 
         self.api_component_status = get_current_status(self.api_url, self.component_id, self.headers)
 
         if self.status == self.api_component_status:
+            self.logger.info(f'Not pushing status since they are both {self.status}.')
             return
 
         params = {'id': self.component_id, 'status': self.status}
@@ -256,9 +303,9 @@ class Configuration(object):
         It only will send a request if the metric id was set in the configuration.
         In case of failed connection trial pushes the default metric value.
         """
-        if 'metric_id' in self.data['cachet'] and hasattr(self, 'request'):
+        if self.metric_id and hasattr(self, 'request'):
             # We convert the elapsed time from the request, in seconds, to the configured unit.
-            value = self.default_metric_value if self.status != 1 else latency_unit.convert_to_unit(self.latency_unit,
+            value = self.default_metric_value if self.status != st.COMPONENT_STATUS_OPERATIONAL else latency_unit.convert_to_unit(self.latency_unit,
                                                                                                     self.request.elapsed.total_seconds())
             params = {'id': self.metric_id, 'value': value,
                       'timestamp': self.current_timestamp}
@@ -278,13 +325,17 @@ class Configuration(object):
         """
         if not self.trigger_update:
             return
+
+        if self.check_maintenance() and 'CREATE_INCIDENT' in self.observe_maintenance:
+            self.logger.info('Not creating incident do to config and maintenance mode.')
+            # We are in maintenance and should not create an incident
+            return
+
         if hasattr(self, 'incident_id') and self.status == st.COMPONENT_STATUS_OPERATIONAL:
             # If the incident already exists, it means it was unhealthy but now it's healthy again.
-            params = {'status': 4, 'visible': self.public_incidents, 'component_id': self.component_id,
-                      'component_status': self.status,
-                      'notify': True}
+            params = {'status': 4, 'message': f'{self.endpoint_url} available again.'}
 
-            incident_request = requests.put('%s/incidents/%d' % (self.api_url, self.incident_id), params=params,
+            incident_request = requests.post('%s/incidents/%d/updates' % (self.api_url, self.incident_id), params=params,
                                             headers=self.headers)
             if incident_request.ok:
                 # Successful metrics upload
