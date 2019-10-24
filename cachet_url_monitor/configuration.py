@@ -110,7 +110,7 @@ class Configuration(object):
             self.default_metric_value = self.get_default_metric_value(self.metric_id)
 
         # The latency_unit configuration is not mandatory and we fallback to seconds, by default.
-        self.latency_unit = self.data['cachet'].get('latency_unit') or 's'
+        self.latency_unit = self.endpoint.get('latency_unit') or 's'
 
         # We need the current status so we monitor the status changes. This is necessary for creating incidents.
         self.status = get_current_status(self.api_url, self.component_id, self.headers)
